@@ -1,0 +1,55 @@
+# Shared security gates for every Operation Forward repository: the Vibe Sec Ops gates used on
+# the Foxx Cyber projects. Scanners run as pinned images (no third-party actions). Call it from a
+# repository's ci.yml, pinned to a commit of this repository (the org requires SHA pins):
+#
+#   security:
+#     uses: Operation-Forward/.github/.github/workflows/gates.yml@<sha> # vX.Y.Z
+#     with:
+#       semgrep-configs: p/golang p/dockerfile p/secrets
+#       semgrep-exclude: "*_test.go"
+#
+# The required status check is "<caller job id> / gates", e.g. "security / gates".
+name: gates
+
+on:
+  workflow_call:
+    inputs:
+      semgrep-configs:
+        description: Space-separated Semgrep rulesets.
+        type: string
+        default: p/secrets
+      semgrep-exclude:
+        description: Space-separated paths or globs Semgrep skips (tests, generated files).
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      ACTIONLINT: docker.io/rhysd/actionlint:1.7.12
+      SEMGREP: docker.io/semgrep/semgrep:1.179.0
+      TRIVY: docker.io/aquasec/trivy:0.75.0
+      SEMGREP_CONFIGS: ${{ inputs.semgrep-configs }}
+      SEMGREP_EXCLUDE: ${{ inputs.semgrep-exclude }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Workflow lint (actionlint + shellcheck)
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT" -color
+      - name: Semgrep
+        run: |
+          set -f # the exclude globs are for Semgrep, not for this shell
+          args=()
+          for c in $SEMGREP_CONFIGS; do args+=(--config "$c"); done
+          for e in $SEMGREP_EXCLUDE; do args+=(--exclude "$e"); done
+          docker run --rm -v "$PWD:/src:ro" -w /src "$SEMGREP" semgrep scan --metrics=off --error "${args[@]}"
+      - name: Trivy filesystem (dependencies and secrets)
+        run: >-
+          docker run --rm -v "$PWD:/src:ro" "$TRIVY"
+          fs --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 /src

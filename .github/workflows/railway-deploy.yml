@@ -1,0 +1,172 @@
+# Railway deploy after a green main pipeline. Ported from the Foxx Cyber ci-projects
+# railway-deploy component (mode `up`), which has shipped Foxx services since 2026-08.
+#
+#   deploy:
+#     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+#     needs: [image]        # every gate before this job must be green
+#     uses: Operation-Forward/.github/.github/workflows/railway-deploy.yml@<sha> # vX.Y.Z
+#     with:
+#       service: backend
+#       project-id: <railway project uuid>
+#       url: https://example.up.railway.app
+#       health-path: /api/v1/meta
+#     secrets:
+#       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+#
+# RAILWAY_TOKEN is a Railway *project* token (Project -> Settings -> Tokens, environment
+# production). Without it the job warns and skips instead of failing main.
+#
+# `railway up` uploads the checkout and Railway builds the Dockerfile. The CLI is pinned: a
+# later `:latest` changed `railway up`'s positional argument from "directory" to "monorepo
+# prefix" and broke every deploy, so no path argument is passed. `--ci` returns when the BUILD
+# ends; the loop below waits for the new deployment to reach SUCCESS (Railway's own
+# healthcheck gates that), then the public URL must answer 200.
+name: railway-deploy
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Railway service name or ID.
+        type: string
+        required: true
+      project-id:
+        description: Railway project ID. Checked against the token so a token pasted into the wrong repo fails loudly.
+        type: string
+        required: true
+      environment:
+        description: Railway environment name, checked against the token.
+        type: string
+        default: production
+      url:
+        description: Public base URL used for the post-deploy check.
+        type: string
+        required: true
+      health-path:
+        description: Path appended to url; must answer 200 after the deploy.
+        type: string
+        default: /healthz
+      timeout-seconds:
+        description: How long to wait for the new deployment to reach SUCCESS.
+        type: number
+        default: 900
+    secrets:
+      RAILWAY_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # One deploy at a time per service: two main pushes close together must not race.
+    concurrency:
+      group: railway-${{ inputs.service }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      RAILWAY_CLI: ghcr.io/railwayapp/cli:5.45.2
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_SERVICE: ${{ inputs.service }}
+      RAILWAY_PROJECT_ID: ${{ inputs.project-id }}
+      RAILWAY_ENVIRONMENT: ${{ inputs.environment }}
+      DEPLOY_URL: ${{ inputs.url }}
+      HEALTH_PATH: ${{ inputs.health-path }}
+      DEPLOY_TIMEOUT: ${{ inputs.timeout-seconds }}
+    steps:
+      - name: Check for RAILWAY_TOKEN
+        id: token
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::warning title=Not deployed::RAILWAY_TOKEN is not set, so $RAILWAY_SERVICE was not deployed. Add a Railway project token (environment $RAILWAY_ENVIRONMENT) as the repository secret RAILWAY_TOKEN."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.token.outputs.present == 'true'
+        with:
+          persist-credentials: false
+      - name: Deploy
+        if: steps.token.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+
+          railway() { docker run --rm -e RAILWAY_TOKEN -v "$PWD:/src:ro" -w /src --entrypoint railway "$RAILWAY_CLI" "$@"; }
+          gql() {
+            curl -fsS https://backboard.railway.com/graphql/v2 \
+              -H "Project-Access-Token: $RAILWAY_TOKEN" \
+              -H "Content-Type: application/json" --data "$1"
+          }
+
+          # Everything needed is derivable from the token: ask it what it is.
+          ctx=$(gql '{"query":"query { projectToken { projectId environmentId environment { name } project { services { edges { node { id name } } } } } }"}')
+          token_project=$(jq -r '.data.projectToken.projectId // empty' <<<"$ctx")
+          token_env=$(jq -r '.data.projectToken.environment.name // empty' <<<"$ctx")
+          if [ -z "$token_project" ]; then
+            echo "::error::RAILWAY_TOKEN is not a Railway project token (no project context). Create one at Project -> Settings -> Tokens."
+            exit 1
+          fi
+          if [ "$token_project" != "$RAILWAY_PROJECT_ID" ]; then
+            echo "::error::RAILWAY_TOKEN belongs to project $token_project, but this job targets $RAILWAY_PROJECT_ID."
+            exit 1
+          fi
+          if [ -n "$token_env" ] && [ "$token_env" != "$RAILWAY_ENVIRONMENT" ]; then
+            echo "::error::RAILWAY_TOKEN is scoped to environment '$token_env', but this job targets '$RAILWAY_ENVIRONMENT'."
+            exit 1
+          fi
+          service_id=$(jq -r --arg s "$RAILWAY_SERVICE" \
+            '[.data.projectToken.project.services.edges[].node | select(.name == $s or .id == $s)][0].id // empty' <<<"$ctx")
+          if [ -z "$service_id" ]; then
+            echo "::error::Service '$RAILWAY_SERVICE' not found in project $token_project."
+            exit 1
+          fi
+          echo "project $token_project / env $RAILWAY_ENVIRONMENT / service $RAILWAY_SERVICE ($service_id)"
+
+          list() { railway deployment list --service "$service_id" --json 2>/dev/null || echo '[]'; }
+
+          # Snapshot the newest deployment first, to tell ours apart from what was there.
+          prev_id=$(list | jq -r '.[0].id // empty')
+          echo "previous deployment: ${prev_id:-none}"
+
+          railway up --ci --service "$service_id"
+
+          deadline=$(( $(date +%s) + DEPLOY_TIMEOUT ))
+          new_id="" status=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            row=$(list | jq -c --arg prev "$prev_id" '[.[] | select(.id != $prev)][0] // empty')
+            if [ -n "$row" ]; then
+              new_id=$(jq -r .id <<<"$row")
+              status=$(jq -r .status <<<"$row")
+              echo "deployment $new_id: $status"
+              case "$status" in
+                SUCCESS) break ;;
+                FAILED|CRASHED|REMOVED)
+                  echo "::error::Deployment $new_id ended in $status. Last log lines:"
+                  railway logs --service "$service_id" -d -n 80 2>/dev/null || true
+                  exit 1 ;;
+              esac
+            else
+              echo "waiting for Railway to register the new deployment..."
+            fi
+            sleep 10
+          done
+          if [ "$status" != "SUCCESS" ]; then
+            echo "::error::Timed out after ${DEPLOY_TIMEOUT}s waiting for SUCCESS (last: ${status:-none})."
+            exit 1
+          fi
+
+          code=000
+          for i in $(seq 1 12); do
+            code=$(curl -s -o health.out -w '%{http_code}' --max-time 15 "$DEPLOY_URL$HEALTH_PATH" || echo 000)
+            [ "$code" = 200 ] && break
+            echo "health attempt $i: HTTP $code, retrying in 10s"
+            sleep 10
+          done
+          if [ "$code" != 200 ]; then
+            echo "::error::Post-deploy check failed: $DEPLOY_URL$HEALTH_PATH answered HTTP $code."
+            head -c 500 health.out || true
+            exit 1
+          fi
+          echo "deployed $RAILWAY_SERVICE ($new_id): $DEPLOY_URL$HEALTH_PATH is 200"
